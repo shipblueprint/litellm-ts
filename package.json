@@ -1,0 +1,52 @@
+{
+  "name": "litellm-proxy",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible LLM proxy — 22 providers, failover routing, streaming. Bun/Hono.",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "litellm-proxy": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "prebuild": "bun build src/index.ts --outdir ./dist --target bun",
+    "build": "echo 'Built to dist/index.js'",
+    "prestart": "npm run prebuild",
+    "start": "bun run dist/index.js",
+    "compile": "bun build --compile src/index.ts --outfile litellm-proxy",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "bunx oxlint",
+    "prepublishOnly": "bun run prebuild"
+  },
+  "keywords": [
+    "llm",
+    "proxy",
+    "openai",
+    "anthropic",
+    "gemini",
+    "ollama",
+    "azure",
+    "ai",
+    "gateway",
+    "chat",
+    "completions"
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "license": "MIT",
+  "dependencies": {
+    "hono": "^4.12.28"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}
