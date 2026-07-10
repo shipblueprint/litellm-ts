@@ -1,6 +1,45 @@
-# LiteLLM Proxy (Bun)
+# litellm-proxy
 
-An OpenAI-compatible API proxy built with Bun and Hono. Routes requests to multiple LLM providers (Anthropic, OpenAI, Groq) with automatic format translation.
+A **lightweight TypeScript port of [LiteLLM](https://github.com/BerriAI/litellm)** — the popular Python LLM gateway.
+
+> [LiteLLM](https://github.com/BerriAI/litellm) is a Python SDK + proxy server that maps 100+ LLM APIs onto the OpenAI format. This project is a **minimal, single-binary** reimplementation of the proxy's core idea: **one OpenAI-compatible endpoint, many providers, zero client changes.** It keeps the same mental model (route by model name → translate or pass through) but in ~a few thousand lines of TypeScript instead of the full Python stack.
+
+An OpenAI-compatible API gateway built with **[Bun](https://bun.sh)** and **[Hono](https://hono.dev)**. Point any OpenAI SDK at it and route requests to Anthropic, OpenAI, Google Gemini, Azure, Ollama, Groq, and 15+ other OpenAI-compatible providers — with automatic request/response format translation for the providers that need it.
+
+```
+your OpenAI SDK  ──►  litellm-proxy (Bun + Hono)  ──►  Anthropic / OpenAI / Gemini / Azure / Ollama / Groq / ...
+                        ▲
+                  same OpenAI API your code already uses
+```
+
+> 📊 Architecture diagram: [`ARCHITECTURE.mmd`](./ARCHITECTURE.mmd) (Mermaid)
+
+---
+
+## Why this instead of LiteLLM?
+
+| | LiteLLM (Python) | litellm-proxy (this repo) |
+|---|---|---|
+| Language | Python | TypeScript (Bun runtime) |
+| Scope | 100+ providers, budgeting, virtual keys, guardrails, UI | Core gateway: routing + translation + failover |
+| Footprint | Python + deps, Redis, Postgres (for full features) | Single binary, SQLite (built into Bun) |
+| Best for | Teams needing the full platform | Personal use / embedded gateway with minimal deps |
+
+Use this when you want the *LiteLLM routing concept* without the Python dependency tree — e.g. a small self-hosted gateway, an embedded proxy inside a TS app, or a learning reference for how provider translation works.
+
+---
+
+## Features
+
+- **One OpenAI-compatible endpoint** — `/v1/chat/completions` works with the official OpenAI SDK and any compatible client. No client code changes.
+- **Provider routing by model name** — regex-based routing table (`src/config.ts`). `claude-*` → Anthropic, `gpt-*` → OpenAI, `gemini-*` → Google, `azure/...` → Azure, `ollama/...` → Ollama, and so on.
+- **Format translation where needed** — Anthropic, Google Gemini, Azure, and Ollama use *dedicated handlers* that translate messages, tool calls, and streaming between their native API and the OpenAI shape. OpenAI-compatible providers (Groq, Together, Mistral, xAI, DeepSeek, etc.) are passed through as-is.
+- **Automatic failover** — if a provider returns 429/5xx, it's put on a 30s SQLite cooldown and the request is retried against the next model in the fallback chain (`src/router.ts`).
+- **Built-in metrics** — every request is logged to SQLite (`provider_cooldowns`, `request_log`) with per-provider success/error/latency aggregation over the last hour (`getMetrics()`).
+- **Security hardening** — 1 MB body-size limit (DoS prevention), error-message sanitization that strips leaked API-key fragments, and optional proxy-level bearer auth (`PROXY_API_KEY`).
+- **Single-binary deploy** — `bun build --compile` produces a standalone executable with no installed runtime. Docker image also provided.
+
+---
 
 ## Quick Start
 
@@ -9,49 +48,97 @@ bun install
 bun run dev
 ```
 
+The server listens on `PORT` (default `3000`).
+
+---
+
 ## Usage
 
+Send requests exactly as you would to OpenAI — just set the `model` to the provider-prefixed name and use your **upstream provider key** in the `Authorization` header.
+
 ```bash
-# Non-streaming
+# Anthropic (full translation: messages, tools, streaming)
 curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer $YOUR_API_KEY" \
+  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
 
-# Streaming
+# OpenAI (passthrough)
 curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer $YOUR_API_KEY" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-## Supported Models
+List models:
 
-| Prefix | Provider | Notes |
+```bash
+curl http://localhost:3000/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+---
+
+## Supported Providers
+
+Routing is determined by the `model` string prefix (first match wins). Translation providers rewrite the request/response; passthrough providers forward to an OpenAI-compatible endpoint.
+
+| Model prefix | Provider | Mode |
 |---|---|---|
-| `claude-*` | Anthropic | Full translation (messages, tools, streaming) |
-| `gpt-*` | OpenAI | Passthrough |
-| `o1-*`, `o3-*` | OpenAI | Passthrough |
-| `gemini-*` | Google | **Not implemented** — route exists but no handler |
-| `mixtral-*`, `llama-*`, `deepseek-*` | Groq | OpenAI-compatible passthrough |
-| (anything else) | OpenAI | Default fallback |
+| `claude-*` | Anthropic | **Translation** (messages, tools, streaming) |
+| `gemini-*` | Google Gemini | **Translation** (messages, tools, streaming) |
+| `azure/*` | Azure OpenAI | **Translation** (`api-key` auth + deployment URL routing) |
+| `ollama/*` | Ollama | **Translation** (NDJSON stream → SSE) |
+| `gpt-*`, `o1-*`, `o3-*` | OpenAI | Passthrough |
+| `mixtral*`, `llama*`, `gemma*` | Groq | Passthrough |
+| `accounts/fireworks/models/*` | Fireworks | Passthrough |
+| `meta-llama/*`, `mistralai/*`, `deepseek-ai/*` | Together | Passthrough |
+| `mistral*`, `codestral*` | Mistral | Passthrough |
+| `grok-*` | xAI | Passthrough |
+| `deepseek-*` | DeepSeek | Passthrough |
+| `Meta-Llama-*` | SambaNova | Passthrough |
+| `cerebras/*` | Cerebras | Passthrough |
+| `deepinfra/*` | DeepInfra | Passthrough |
+| `hyperbolic/*` | Hyperbolic | Passthrough |
+| `nebius/*` | Nebius | Passthrough |
+| `novita/*` | Novita | Passthrough |
+| `friendliai/*` | FriendliAI | Passthrough |
+| `openrouter/*` | OpenRouter | Passthrough |
+| `github/*` | GitHub Models | Passthrough |
+| `cloudflare/*` | Cloudflare | Passthrough |
+| *(anything else)* | OpenAI | Default fallback |
+
+> Adding a provider is usually a one-file change — see `src/providers/_template.ts`.
+
+---
 
 ## Configuration
 
 Copy `.env.example` to `.env`:
 
 ```bash
-PORT=3000                    # Server port
-PROXY_API_KEY=               # Optional: gate access to the proxy
+PORT=3000                  # Server port (default 3000)
+PROXY_API_KEY=             # Optional: gate access to the proxy with a static bearer key.
+                           # Users still send THEIR OWN upstream provider keys downstream.
+FALLBACKS=openai,anthropic,groq   # Comma-separated fallback chain (see Failover below)
 ```
+
+### Failover
+
+When a provider errors with `429`/`5xx`, it enters a 30-second cooldown and the router retries the next model in the fallback chain defined in `FALLBACK_CHAINS` (`src/router.ts`). Example: a failed `claude-*` request automatically retries `gpt-4o` → `llama-3-70b-8192`.
+
+---
 
 ## Build & Deploy
 
 ```bash
-# Development
+# Development (hot reload)
 bun run dev
 
-# Production binary (no runtime needed)
+# Type-check / lint
+bun run typecheck
+bun run lint
+
+# Production binary — no runtime needed
 bun run compile
 ./litellm-proxy
 
@@ -62,78 +149,74 @@ docker run -p 3000:3000 litellm-proxy
 
 ---
 
-## Known Limitations & Future Work
-
-### Multi-User Support (Not Implemented)
-
-This proxy is designed for **personal use only**. The current auth model is "key passthrough" — each client sends their own upstream API key, which gets forwarded to the provider as-is. There is no user management.
-
-**If you want to add multi-user support, here are the concerns:**
-
-1. **No user identity** — The proxy has no concept of "users". It cannot distinguish who is making a request. The optional `PROXY_API_KEY` is a single static gate key, not a per-user credential.
-
-2. **No per-user rate limiting** — A single abusive client can exhaust upstream quotas for everyone. You'd need a users table, per-user key validation, and rate limiting middleware (e.g., token bucket per user).
-
-3. **No per-user usage tracking** — The SQLite `request_log` tracks by model/provider but not by user. You can't answer "how much did user X spend?" without adding a `user` column and logging it from the middleware.
-
-4. **No upstream key rotation** — Each user must bring their own API key. If you want the proxy to own the keys, you need key vault, rotation logic, and per-user quota enforcement.
-
-5. **No audit logging** — Request logs don't include who made the request. For multi-user, you'd want to log user ID, IP, request body hash, and response status.
-
-6. **No input sanitization** — No validation of message format beyond basic JSON parsing. Malformed tool calls or image URLs could cause upstream errors.
-
-7. **No request body size limit** — No middleware to cap request body size.
-
-**To implement multi-user, you would add:**
-- `users` table: `id`, `api_key_hash`, `rate_limit`, `quota`, `created_at`
-- Authentication middleware that hashes the incoming key and looks up the user
-- Per-user rate limiting (e.g., sliding window counter in SQLite)
-- Usage logging with user ID foreign key
-- An admin API for user management
-
-### Other Missing Pieces
-
-- **Google Gemini** — Route exists in config but no handler. Gemini is NOT OpenAI-compatible; needs full message/response translation like Anthropic.
-- **Azure OpenAI** — Different auth (OAuth / `api-key` header), different URL format. ~4h to implement.
-- **Cohere** — Different message format, different streaming. ~6h.
-- **Mistral** — Mostly OpenAI-compatible but some param differences. ~2h.
-- **Anthropic `stream_options`** — OpenAI clients can send `stream_options: { include_usage: true }` to get token counts in the final streaming chunk. Not yet forwarded to Anthropic.
-- **`stop_sequences` limit** — Anthropic allows max 4 stop sequences; no validation before sending.
-
-## Architecture
+## How it works
 
 ```
 Client → POST /v1/chat/completions
-         Auth: Bearer <user-provided-api-key>
-         Body: { model: "claude-sonnet-4-20250514", messages: [...] }
+         Auth: Bearer <user-provided upstream API key>
+         Body: { "model": "claude-sonnet-4-20250514", "messages": [...] }
                   │
-                  ▼
-           resolveProvider("claude-sonnet-4-20250514")
-                  │
-                  ▼ regex match /^claude/
+                  ▼ resolveProvider(model)        ← regex match in src/config.ts
                   │
         ┌─────────▼─────────┐
-        │  AnthropicHandler  │
-        │  transformRequest  │  ← Maps messages, params, tools
-        │                    │     to Anthropic API format
+        │  Handler dispatch  │   anthropic/google/azure/ollama → translation
+        │                    │   openai/groq/...                 → passthrough
         └─────────┬─────────┘
                   │
-                  ▼ fetch(POST https://api.anthropic.com/v1/messages,
-                  │         x-api-key: <user-key>)
+                  ▼ fetch(upstream API, x-api-key / Authorization: <user-key>)
                   │
         ┌─────────▼─────────┐
-        │  Non-streaming?    │
-        │  Yes → parse JSON  │
-        │  No  → pipe stream │
-        └─────────┬─────────┘
-                  │
-        ┌─────────▼─────────┐
-        │  transformResponse │  ← Converts Anthropic content blocks,
-        │  OR chunkTransform │     stop_reason, usage → OpenAI format
+        │  Non-streaming?    │  Yes → parse + transformResponse
+        │  No  → pipe SSE    │  No  → chunkTransform per event
         └─────────┬─────────┘
                   │
                   ▼ return OpenAI-compatible JSON / SSE stream
 ```
+
+On error, the request is logged to SQLite and — if retryable — the provider is cooled down and the fallback chain is tried.
+
+---
+
+## Auth model & limitations
+
+**This proxy is built for personal / single-tenant use.** Auth is **key passthrough**: the client supplies their own upstream provider key in the `Authorization` header, which is forwarded as-is. The optional `PROXY_API_KEY` is a single static gate key — it is *not* per-user identity.
+
+Not implemented (unlike the full LiteLLM platform):
+
+- **No multi-user / virtual keys** — there is no user table, per-user rate limiting, or quota enforcement.
+- **No usage billing** — SQLite `request_log` tracks by model/provider, not by user, and stores no cost/spend.
+- **No guardrails / moderation** — requests pass straight through to the provider.
+- **No persistent key vault** — the proxy never stores upstream keys; the client must supply them each request.
+- **Tool/streaming edge cases** — e.g. Anthropic `stream_options: { include_usage: true }` is not yet forwarded; stop-sequence count is not pre-validated against Anthropic's max-4 limit.
+
+---
+
+## Project layout
+
+```
+src/
+  index.ts            Hono app, /v1/chat/completions + /v1/models
+  config.ts           MODEL_ROUTES routing table + resolveProvider()
+  router.ts           Failover chain, cooldowns, retry logic
+  db.ts               SQLite cooldowns + request metrics
+  security.ts         Body-size limit + error sanitization
+  startup.ts          .env auto-load + provider-detection banner
+  types.ts            OpenAI-compatible request/response types
+  providers/
+    base.ts           ProviderHandler interface
+    openai.ts         Passthrough handler (shared by OpenAI-compatible providers)
+    anthropic.ts      Full translation handler
+    google.ts         Full translation handler (Gemini)
+    azure.ts          api-key auth + deployment URL routing
+    ollama.ts         NDJSON → SSE translation
+    _template.ts      Starter for adding a new provider
+  streaming/
+    sse-parser.ts     SSE event parser
+    anthropic.ts      Anthropic chunk → OpenAI chunk transform
+    ollama.ts         Ollama stream → OpenAI SSE transform
+```
+
+---
 
 ## License
 
