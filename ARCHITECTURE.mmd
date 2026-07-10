@@ -1,0 +1,83 @@
+flowchart TB
+  subgraph Client["Client"]
+    CURL["curl / any OpenAI SDK"]
+  end
+
+  subgraph Proxy["litellm-proxy (Bun + Hono)"]
+    direction TB
+    AUTH["Auth Middleware<br/>Bearer token check<br/>(optional PROXY_API_KEY)"]
+    SIZE["Body Size Limit<br/>1MB max (DoS prevention)"]
+    ROUTER["Route Resolver<br/>regex match model → provider"]
+    HANDLER{"Handler Dispatch"}
+
+    AUTH --> SIZE --> ROUTER --> HANDLER
+  end
+
+  subgraph Handlers["Handler Types"]
+    PASSTHROUGH["Passthrough (openaiHandler)<br/>Forward JSON/SSE as-is"]
+    TRANSLATE["Translation Handler<br/>Convert message/tool/stream format"]
+  end
+
+  subgraph Providers["22 Supported Providers"]
+    direction TB
+    T1["OpenAI<br/>gpt-*, o1-*, o3-*"]
+    T2["Anthropic<br/>claude-*"]
+    T3["Google Gemini<br/>gemini-*"]
+    T4["Groq<br/>mixtral, llama, gemma"]
+    T5["Together<br/>meta-llama, mistralai, deepseek-ai"]
+    T6["Fireworks<br/>accounts/fireworks/models/*"]
+    T7["Mistral<br/>mistral-*, codestral"]
+    T8["xAI<br/>grok-*"]
+    T9["DeepSeek<br/>deepseek-*"]
+    T10["Azure OpenAI<br/>azure/*"]
+    T11["Ollama (local)<br/>ollama/*"]
+    T12["SambaNova, Cerebras, DeepInfra,<br/>Hyperbolic, Nebius, Novita,<br/>FriendliAI, OpenRouter,<br/>GitHub, Cloudflare"]
+  end
+
+  subgraph Streaming["Streaming Pipeline"]
+    direction TB
+    SSE_PARSE["SSE Parser<br/>Buffers lines on \\n boundary<br/>Handles partial chunks<br/>Multi-line events"]
+    STREAM_XFORM["Stream Transformer<br/>Per-provider chunk conversion<br/>→ OpenAI delta format"]
+    SSE_PARSE --> STREAM_XFORM
+  end
+
+  subgraph Failover["Failover & Cooldown"]
+    SQLITE[("SQLite<br/>provider_cooldowns<br/>request_log")]
+    COOLDOWN["Cooldown Logic<br/>30s cooldown on 429/5xx<br/>Consecutive failure tracking"]
+    FALLBACK["Fallback Chains<br/>e.g. claude → gpt-4o → llama"]
+    CHAIN_EXEC["Attempt chain in order<br/>Skip cooldowned providers"]
+    SQLITE --> COOLDOWN
+    COOLDOWN --> CHAIN_EXEC
+    FALLBACK --> CHAIN_EXEC
+  end
+
+  subgraph Security["Security"]
+    S1["SSRF Prevention<br/>Azure base URL from env only"]
+    S2["Error Sanitization<br/>Strip API keys from errors<br/>(sk-***, Bearer ***)"]
+    S3["Body Size Limit<br/>1MB max"]
+  end
+
+  HANDLER -- "OpenAI-compatible<br/>(groq, together, fireworks,<br/>mistral, xai, deepseek,<br/>sambanova, cerebras, deepinfra,<br/>hyperbolic, nebius, novita,<br/>friendliai, openrouter,<br/>github, cloudflare)" --> PASSTHROUGH
+  HANDLER -- "Different API format<br/>(anthropic, google, ollama, azure)" --> TRANSLATE
+
+  PASSTHROUGH --> Providers
+  TRANSLATE --> Providers
+
+  HANDLER -- "stream: true" --> Streaming
+  HANDLER -- "failover on error" --> Failover
+
+  Client -->|"POST /v1/chat/completions<br/>Authorization: Bearer &lt;key&gt;<br/>Body: { model, messages, stream }"| AUTH
+  Providers -->|"fetch upstream API"| RESPONSE
+  RESPONSE["Response<br/>JSON or SSE stream"]
+
+
+  classDef highlight fill:#1a1a2e,stroke:#e94560,stroke-width:2px,color:#fff
+  classDef handler fill:#16213e,stroke:#0f3460,color:#fff
+  classDef provider fill:#0f3460,stroke:#533483,color:#fff
+  classDef infra fill:#222,stroke:#555,color:#fff
+  classDef sec fill:#2d1b1b,stroke:#e94560,color:#fff
+
+  class Proxy,ROUTER,HANDLER highlight
+  class PASSTHROUGH,TRANSLATE handler
+  class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12 provider
+  class AUTH,SIZE,SECURITY,S1,S2,S3 sec
